@@ -1,0 +1,435 @@
+---
+title: "FE542_Project"
+author: 'Team 5: Pairs Trading Analysis'
+date: "May 5, 2018"
+output:
+  word_document:
+    toc: yes
+  html_document:
+    toc: yes
+---
+
+```{r admin, echo=FALSE, include=FALSE}
+knitr::opts_knit$set(root.dir = "C:/FE542/Project/scripts_data")
+knitr::opts_chunk$set(warning=FALSE,error=FALSE,cache=TRUE,fig.keep='all')
+
+source("FE542_Functions.R")
+
+library(knitr)
+library(rmarkdown)
+library(corrplot)
+library(quantmod)
+library(tseries)
+library(xts)
+library(zoo)
+library(PerformanceAnalytics)
+library(plyr)
+library(forecast)
+library(broom)
+library(data.table)
+library(fGarch)
+library(zoo)
+
+seed = 1234
+
+```
+
+(1) Load Data
+```{r Data_Loading, warning=FALSE, error=FALSE, echo=FALSE, include=TRUE}
+
+indexes      <- c("^GSPC","DJIA")
+sectors      <- c("XLF","XLK","XLV","XLE","XLI","XLY","XLP","XLU","XLB","XBI")
+
+to          <- as.character("2018-05-01")             # Today
+from        <- as.character(as.Date(to) - (365*10)) # Start Day - Default for 10 years
+
+as.character(Sys.Date())
+
+# Load index data
+mkt.SP500   <- data_pull("stock/etf", indexes[1], from, to)
+mkt.DJIA    <- getSymbols("^DJI", from = from, to = to)
+mkt.DJIA    <- data.frame(DJI) ; colnames(mkt.DJIA) <- c("Open","High","Low","Close","Volume","Adjusted"); remove(DJI)
+
+index_list <- c("mkt.SP500","mkt.DJIA")
+
+# Load sector ETF data
+s.Fin     <- data_pull("stock/etf", sectors[1],  from, to) # Financial   Sector ETF
+s.Tech    <- data_pull("stock/etf", sectors[2],  from, to) # Technology  Sector ETF
+s.HC      <- data_pull("stock/etf", sectors[3],  from, to) # Health Care Sector ETF
+s.Energy  <- data_pull("stock/etf", sectors[4],  from, to) # Energy      Sector ETF
+s.Ind     <- data_pull("stock/etf", sectors[5],  from, to) # Industrial  Sector ETF
+s.CD      <- data_pull("stock/etf", sectors[6],  from, to) # Cons. Disc. Sector ETF
+s.CS      <- data_pull("stock/etf", sectors[7],  from, to) # Cons. Stpl. Sector ETF
+s.Util    <- data_pull("stock/etf", sectors[8],  from, to) # Utilities   Sector ETF
+s.Mat     <- data_pull("stock/etf", sectors[9],  from, to) # Materials   Sector ETF
+s.Bio     <- data_pull("stock/etf", sectors[10], from, to) # Biotech     Sector ETF
+sector_list <- c("s.Fin","s.Tech","s.HC","s.Energy","s.Ind","s.CD","s.CS","s.Util","s.Mat","s.Bio")
+
+strip.what = "Open"
+
+# Strip prices for equity (ohlc) data sets
+{
+  # Index Data
+  mkt.SP500   <- strip.param(mkt.SP500  , strip.what)
+  mkt.DJIA    <- strip.param(mkt.DJIA   , strip.what)
+  
+  # Sector ETF 
+  s.Fin       <- strip.param(s.Fin      , strip.what)
+  s.Tech      <- strip.param(s.Tech     , strip.what)
+  s.HC        <- strip.param(s.HC       , strip.what)
+  s.Energy    <- strip.param(s.Energy   , strip.what)
+  s.Ind       <- strip.param(s.Ind      , strip.what)
+  s.CD        <- strip.param(s.CD       , strip.what)
+  s.CS        <- strip.param(s.CS       , strip.what)
+  s.Util      <- strip.param(s.Util     , strip.what)
+  s.Mat       <- strip.param(s.Mat      , strip.what)
+  s.Bio       <- strip.param(s.Bio      , strip.what)
+}
+
+# Set data to clean
+data.d   <- list(mkt.DJIA,mkt.SP500,s.Bio,s.CD,s.CS,s.Energy,s.Fin,s.HC,s.Ind,s.Mat,s.Tech,s.Util)
+data.d.c <- c("djia","sp500","s.bio","s.cd","s.cs","s.energy","s.fin","s.hc","s.ind","s.mat","s.tech","s.util")
+
+# Calculate Daily Returns - If adding params, check for column omit (any data series not "daily" should be omittied here)
+daily.p       <- comp.data("d",data.d,data.d.c,"2008-4-01","2018-4-01") # Combine Data Sets
+daily.p       <- na.omit(daily.p)                                       # Remove rows with NA data
+daily.r       <- calc.ret.df(daily.p)                                   # Create Returns Datatable
+
+# Final Data Sets for analysis:
+sp500     <- daily.p$sp500
+djia      <- daily.p$djia
+daily.p   <- daily.p[,c(3:12)]
+daily.r   <- daily.r[,c(3:12)]
+
+save(list = c("daily.p","daily.r","sp500","djia"), file = "marketdata.RData")
+
+# Create data sets needed for analysis:
+etf.names    <- names(daily.r)
+
+arma.models  <- list() ; arma.res  <- NULL
+garch.models <- list() ; garch.res <- NULL
+
+pairs.price  <- NULL
+pairs.return <- NULL
+pairs.arma   <- NULL
+pairs.garch  <- NULL
+
+run.what = "report"
+
+```
+
+(2) Analyze Raw Price and Return Correlations and select best pairs
+```{r Price_Return_Pairs, echo=TRUE, include=TRUE}
+set.seed(seed)
+
+pairs.price   <- analyze.ranks(daily.p, "Prices",  print = TRUE, plot = TRUE) ; kable(pairs.price[[1]]  , caption = "Price Pairs Selection")
+pairs.returns <- analyze.ranks(daily.r, "Returns", print = TRUE, plot=TRUE) ; kable(pairs.returns[[1]], caption = "Returns Pairs Selection")
+
+save(pairs.price, file = "pairs_price.Rdata")
+save(pairs.returns, file = "pairs_returns.Rdata")
+
+```
+
+(3) Build ARMA Time Series Models
+```{r ARMA_models, warning=FALSE, echo=TRUE, include=TRUE}
+set.seed(seed)
+
+lags = 20
+sig.id = 0.25
+
+run.what = 'test'
+if(run.what == "test")
+{
+  for(i in 1:ncol(daily.r)) 
+  { 
+    print(paste0('Col: ',i))
+    arma.models[[i]]  <- build.arma(daily.r[,etf.names[i]], lags, sigboost = sig.id, maxcoeff = NULL, 
+                                    use.auto = FALSE, etf.names[i],plot = TRUE, print = TRUE) 
+  }
+  names(arma.models) <- etf.names
+
+  save(arma.models, file = "armamodels.RData")
+}
+
+if(run.what == "report")
+{
+  load("armamodels.Rdata")
+  
+  for(i in 1:length(names(arma.models))) 
+  { 
+    get.orders(daily.r[,names(arma.models)[i]], lags, sig.id, "data", names(arma.models)[i], print=FALSE, plotr=TRUE)
+  }
+}
+
+
+```
+
+(4) Analyze Residuals for good model fit and Garch Effects (also collect residuals data for trading)
+```{r ARMA_res, echo=TRUE, include=TRUE}
+load("armamodels.Rdata")
+set.seed(seed)
+
+arma.res <- model.residuals(arma.models, "arma", TRUE)
+
+save(arma.res, file = "arma_res.RData")
+
+```
+
+(5) Analyze ARMA Residual Correlations and select best pairs
+```{r ARMA_pairs, echo=TRUE, include=TRUE}
+set.seed(seed)
+
+pairs.arma <- analyze.ranks(arma.res, "ARMA residuals" ,print = TRUE)
+kable(pairs.arma[[1]] , caption = "ARMA Residuals Pairs Selection")
+
+save(pairs.arma, file = "pairs_arma.RData")
+
+```
+
+(6) Fit GARCH Variance Models
+```{r GARCH_models, warning=FALSE, echo=TRUE, include=TRUE}
+set.seed(seed)
+
+if(run.what == "test")
+{
+  garch.models <- build.garch(arma.models, daily.r, mlim = 2, slim = 2 ,criteria = "aic", print = TRUE)
+  save(garch.models, file = "garchmodels.RData")
+}
+
+```
+
+--- Model Output:
+[1] -------------------------------------------------------------------------------------------
+[1] GARCH(m,s) order limits:
+[1] m -> [1:2]
+[1] s -> [1:2]
+[1] Distributions being tested = (norm,std)
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.bio
+[1] (1) Distribution = norm
+[1] arma(4,0)+garch(1,1) has AIC/LLH = -5.179 / -6463.664
+[1] arma(4,0)+garch(1,2) has AIC/LLH = -5.1803 / -6466.2889
+[1] arma(4,0)+garch(2,1) has AIC/LLH = -5.178 / -6463.3411
+[1] arma(4,0)+garch(2,2) rejected based on NaNs in error testing phase
+[1] (2) Distribution = std
+[1] arma(4,0)+garch(1,1) has AIC/LLH = -5.2033 / -6494.866
+[1] arma(4,0)+garch(1,2) has AIC/LLH = -5.204 / -6496.7359
+[1] arma(4,0)+garch(2,1) has AIC/LLH = -5.2022 / -6494.5801
+[1] arma(4,0)+garch(2,2) rejected based on NaNs in error testing phase
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 6 which is 75 % of possible 8 models
+[1] Best model: arma(4,0)+garch(1,2) with dist = std where aic = -5.204
+[1] ### RUN TIME: 7.46928405761719
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.cd
+[1] (1) Distribution = norm
+[1] arma(15,16)+garch(1,1) has AIC/LLH = -6.267 / -7846.8558
+[1] arma(15,16)+garch(1,2) has AIC/LLH = -6.2678 / -7848.8096
+[1] arma(15,16)+garch(2,1) has AIC/LLH = -6.2905 / -7877.1604
+[1] arma(15,16)+garch(2,2) has AIC/LLH = -6.2666 / -7848.2758
+[1] (2) Distribution = std
+[1] arma(15,16)+garch(1,1) has AIC/LLH = -6.3015 / -7890.7813
+[1] arma(15,16)+garch(1,2) has AIC/LLH = -6.3112 / -7903.8925
+[1] arma(15,16)+garch(2,1) has AIC/LLH = -6.3011 / -7891.2787
+[1] arma(15,16)+garch(2,2) has AIC/LLH = -6.3008 / -7891.9484
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 8 which is 100 % of possible 8 models
+[1] Best model: arma(15,16)+garch(1,2) with dist = std where aic = -6.3112
+[1] ### RUN TIME: 16.1526826500893
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.cs
+[1] (1) Distribution = norm
+[1] arma(14,15)+garch(1,1) has AIC/LLH = -6.9367 / -8679.5619
+[1] arma(14,15)+garch(1,2) has AIC/LLH = -6.9414 / -8686.4778
+[1] arma(14,15)+garch(2,1) has AIC/LLH = -6.9435 / -8689.1234
+[1] arma(14,15)+garch(2,2) rejected based on NaNs in error testing phase
+[1] (2) Distribution = std
+[1] arma(14,15)+garch(1,1) has AIC/LLH = -7.0125 / -8775.0852
+[1] arma(14,15)+garch(1,2) has AIC/LLH = -6.9978 / -8757.7716
+[1] arma(14,15)+garch(2,1) has AIC/LLH = -7.008 / -8770.4187
+[1] arma(14,15)+garch(2,2) rejected based on NaNs in error testing phase
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 6 which is 75 % of possible 8 models
+[1] Best model: arma(14,15)+garch(1,1) with dist = std where aic = -7.0125
+[1] ### RUN TIME: 13.72481833299
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.energy
+[1] (1) Distribution = norm
+[1] arma(13,14)+garch(1,1) has AIC/LLH = -5.7341 / -7178.5556
+[1] arma(13,14)+garch(1,2) rejected based on NaNs in error testing phase
+[1] arma(13,14)+garch(2,1) has AIC/LLH = -5.7328 / -7177.9609
+[1] arma(13,14)+garch(2,2) rejected based on NaNs in error testing phase
+[1] (2) Distribution = std
+[1] arma(13,14)+garch(1,1) has AIC/LLH = -5.7352 / -7180.9769
+[1] arma(13,14)+garch(1,2) has AIC/LLH = -5.7367 / -7183.7901
+[1] arma(13,14)+garch(2,1) has AIC/LLH = -5.7342 / -7180.6631
+[1] arma(13,14)+garch(2,2) has AIC/LLH = -5.734 / -7181.4767
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 6 which is 75 % of possible 8 models
+[1] Best model: arma(13,14)+garch(1,2) with dist = std where aic = -5.7367
+[1] ### RUN TIME: 7.80436304807663
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.fin
+[1] (1) Distribution = norm
+[1] arma(17,14)+garch(1,1) has AIC/LLH = -5.7804 / -7240.2235
+[1] arma(17,14)+garch(1,2) has AIC/LLH = -5.7826 / -7243.9847
+[1] arma(17,14)+garch(2,1) has AIC/LLH = -5.7807 / -7241.6525
+[1] arma(17,14)+garch(2,2) rejected based on NaNs in error testing phase
+[1] (2) Distribution = std
+[1] arma(17,14)+garch(1,1) has AIC/LLH = -5.8218 / -7292.9218
+[1] arma(17,14)+garch(1,2) has AIC/LLH = -5.8211 / -7293.0389
+[1] arma(17,14)+garch(2,1) has AIC/LLH = -5.8197 / -7291.3163
+[1] arma(17,14)+garch(2,2) rejected based on NaNs in error testing phase
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 6 which is 75 % of possible 8 models
+[1] Best model: arma(17,14)+garch(1,1) with dist = std where aic = -5.8218
+[1] ### RUN TIME: 14.5544658025106
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.hc
+[1] (1) Distribution = norm
+[1] arma(15,16)+garch(1,1) has AIC/LLH = -6.5226 / -8165.4451
+[1] arma(15,16)+garch(1,2) has AIC/LLH = -6.5213 / -8164.8337
+[1] arma(15,16)+garch(2,1) has AIC/LLH = -6.5212 / -8164.6693
+[1] arma(15,16)+garch(2,2) has AIC/LLH = -6.5213 / -8165.7391
+[1] (2) Distribution = std
+[1] arma(15,16)+garch(1,1) has AIC/LLH = -6.5704 / -8225.9973
+[1] arma(15,16)+garch(1,2) has AIC/LLH = -6.5713 / -8228.1508
+[1] arma(15,16)+garch(2,1) has AIC/LLH = -6.5697 / -8226.1306
+[1] arma(15,16)+garch(2,2) has AIC/LLH = -6.5687 / -8225.9314
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 8 which is 100 % of possible 8 models
+[1] Best model: arma(15,16)+garch(1,2) with dist = std where aic = -6.5713
+[1] ### RUN TIME: 18.5536112030347
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.ind
+[1] (1) Distribution = norm
+[1] arma(15,15)+garch(1,1) has AIC/LLH = -6.219 / -7785.9917
+[1] arma(15,15)+garch(1,2) has AIC/LLH = -6.2294 / -7799.8873
+[1] arma(15,15)+garch(2,1) has AIC/LLH = -6.2148 / -7781.764
+[1] arma(15,15)+garch(2,2) has AIC/LLH = -6.2189 / -7787.8811
+[1] (2) Distribution = std
+[1] arma(15,15)+garch(1,1) has AIC/LLH = -6.2494 / -7824.8408
+[1] arma(15,15)+garch(1,2) has AIC/LLH = -6.2483 / -7824.4912
+[1] arma(15,15)+garch(2,1) has AIC/LLH = -6.2476 / -7823.5926
+[1] arma(15,15)+garch(2,2) has AIC/LLH = -6.2476 / -7824.674
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 8 which is 100 % of possible 8 models
+[1] Best model: arma(15,15)+garch(1,1) with dist = std where aic = -6.2494
+[1] ### RUN TIME: 29.3999124010404
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.mat
+[1] (1) Distribution = norm
+[1] arma(18,15)+garch(1,1) has AIC/LLH = -5.9667 / -7474.506
+[1] arma(18,15)+garch(1,2) has AIC/LLH = -5.9461 / -7449.784
+[1] arma(18,15)+garch(2,1) has AIC/LLH = -5.9698 / -7479.3753
+[1] arma(18,15)+garch(2,2) has AIC/LLH = -5.9672 / -7477.0577
+[1] (2) Distribution = std
+[1] arma(18,15)+garch(1,1) has AIC/LLH = -6.0109 / -7530.6358
+[1] arma(18,15)+garch(1,2) has AIC/LLH = -6 / -7518.0453
+[1] arma(18,15)+garch(2,1) has AIC/LLH = -6.015 / -7536.7218
+[1] arma(18,15)+garch(2,2) rejected based on NaNs in error testing phase
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 7 which is 87.5 % of possible 8 models
+[1] Best model: arma(18,15)+garch(2,1) with dist = std where aic = -6.015
+[1] ### RUN TIME: 21.6814234336217
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.tech
+[1] (1) Distribution = norm
+[1] arma(14,8)+garch(1,1) has AIC/LLH = -6.323 / -7907.6411
+[1] arma(14,8)+garch(1,2) has AIC/LLH = -6.3236 / -7909.4297
+[1] arma(14,8)+garch(2,1) has AIC/LLH = -6.3222 / -7907.6185
+[1] arma(14,8)+garch(2,2) has AIC/LLH = -6.3229 / -7909.4725
+[1] (2) Distribution = std
+[1] arma(14,8)+garch(1,1) has AIC/LLH = -6.377 / -7975.9329
+[1] arma(14,8)+garch(1,2) has AIC/LLH = -6.3755 / -7975.0807
+[1] arma(14,8)+garch(2,1) has AIC/LLH = -6.376 / -7975.6329
+[1] arma(14,8)+garch(2,2) has AIC/LLH = -6.3754 / -7975.9636
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 8 which is 100 % of possible 8 models
+[1] Best model: arma(14,8)+garch(1,1) with dist = std where aic = -6.377
+[1] ### RUN TIME: 7.56099911928177
+[1] -------------------------------------------------------------------------------------------
+[1] Building arma(p,q)+garch(m,s) models for: s.util
+[1] (1) Distribution = norm
+[1] arma(19,7)+garch(1,1) has AIC/LLH = -6.5509 / -8195.6509
+[1] arma(19,7)+garch(1,2) has AIC/LLH = -6.5544 / -8201.0236
+[1] arma(19,7)+garch(2,1) has AIC/LLH = -6.5665 / -8216.095
+[1] arma(19,7)+garch(2,2) has AIC/LLH = -6.5562 / -8204.2467
+[1] (2) Distribution = std
+[1] arma(19,7)+garch(1,1) has AIC/LLH = -6.5752 / -8226.9887
+[1] arma(19,7)+garch(1,2) has AIC/LLH = -6.5737 / -8226.0626
+[1] arma(19,7)+garch(2,1) has AIC/LLH = -6.5739 / -8226.3384
+[1] arma(19,7)+garch(2,2) rejected based on NaNs in error testing phase
+[1] -------------------------------------------------------------------------------------------
+[1] Model Selection Criteria = aic
+[1] Models compared = 7 which is 87.5 % of possible 8 models
+[1] Best model: arma(19,7)+garch(1,1) with dist = std where aic = -6.5752
+[1] ### RUN TIME: 8.95032860040665
+[1] -------------------------------------------------------------------------------------------
+
+(7) Analyze ARMA+GARCH Residual Correlations and select best pairs
+```{r GARCH_res, echo=TRUE, include=TRUE}
+set.seed(seed)
+
+load("garchmodels.RData")
+
+garch.res.list <- model.residuals(garch.models, "garch", TRUE)
+
+garch.var <- garch.res.list$var
+garch.res <- garch.res.list$res
+
+save(garch.res, file = "garch_res.RData")
+save(garch.var, file = "garch_var.RData")
+
+```
+
+(8) Garch Residuals Pairs
+```{r GARCH_pair, echo=TRUE, include=TRUE}
+set.seed(seed)
+
+load("garch_res.RData")
+
+pairs.garch <- analyze.ranks(garch.res, "Garch Residuals", print = TRUE)
+kable(pairs.garch[[1]]  , caption = "GARCH Residuals Pairs Selection")
+
+save(pairs.garch, file = "pairs_garch.RData")
+
+```
+
+(9) Conduct Comparable Analysis (The Master Function)
+```{r Conclusions, echo=TRUE, include=TRUE}
+source("FE542_Functions.R")
+
+load("marketdata.RData")
+load("pairs_price.RData")
+load("pairs_returns.RData")
+load("pairs_arma.RData")
+load("pairs_garch.RData")
+load("arma_res.RData")
+load("garch_res.RData")
+load("garch_var.RData")
+
+seed = 1234
+set.seed(seed)
+
+capital = 10000000
+
+datas  <- list(daily.p, daily.r, arma.res, garch.res)
+pairs  <- list(pairs.price, pairs.returns, pairs.arma, pairs.garch)
+names(pairs) <- c("Prices","Returns","ARMA Residuals","GARCH S-Residuals")
+other.tests <- data.frame(sp500,djia)
+colnames(other.tests) <- c("sp500","djia")
+
+test <- master.comp(datas, pairs, garch.var, capital, stop = -0.05, add.test = other.tests, print = FALSE, print.bt = FALSE, print.btALL = FALSE)
+
+```
+
